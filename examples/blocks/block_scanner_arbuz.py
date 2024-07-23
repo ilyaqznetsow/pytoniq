@@ -14,10 +14,8 @@ from aiogram import Bot
 import asyncio
 
 DEX = "779dcc815138d9500e449c5291e7f12738c23d575b5310000f6a253bd607384e"
-POOL_ADDRESS = "EQCQYn1W68q_wx-S6owa0rRbryE77FOT-y_KgzKWmb5A6TKS"
 whitelist = ["EQAM2KWDp9lN0YvxvfSbI0ryjBXwM70rakpNIHbuETatRWA1"]
 
-CHAT_ID = -1001998422328
 
 TOKEN = '6752508886:AAFrq6pAWgHDpOn4oygoMOGrWBrPpqkGDVA'
 bot = Bot(token=TOKEN, parse_mode="HTML")
@@ -70,11 +68,9 @@ def process_metadata(cell: Cell):
 
         return result
 
-async def get_pool_data(client: LiteClient):
-    stack:list = await client.run_get_method(address=POOL_ADDRESS, method="get_pool_data", stack=[])
-    reserve0 = stack[0]
-    reserve1 = stack[1]
-    return reserve0 / 1e9, reserve1 / 1e9
+async def get_pool_address(client: LiteClient, dex_address, token0, token1):
+    stack = await client.run_get_method(address=dex_address, method="get_pool_address", stack=[token0,token1])
+    return stack[2].load_address().to_str(1, 1, 1)
 
 async def is_in_whitelist(client: LiteClient, jetton_wallet):
     try:
@@ -96,18 +92,12 @@ async def get_jetton_content_by_jetton_wallet(client:LiteClient, jetton_wallet):
     stack = await client.run_get_method(address=result["jetton_address"], method="get_jetton_data", stack=[])
     metadata = process_metadata(stack[3])
     if isinstance(metadata, str):
-        try:
-            async with httpx.AsyncClient() as async_client:
-                if metadata[0:4] == "ipfs":
-                    r = await async_client.get(f"https://ipfs.io/ipfs/{metadata.replace('ipfs://', '')}")
-                else:
-                    r = await async_client.get(metadata)
-                r = r.json()
-        except:
-            r = {
-                "decimals": 9,
-                "symbol": "pTON",
-            }
+        async with httpx.AsyncClient() as async_client:
+            if metadata[0:4] == "ipfs":
+                r = await async_client.get(f"https://ipfs.io/ipfs/{metadata.replace('ipfs://', '')}")
+            else:
+                r = await async_client.get(metadata)
+            r = r.json()
         result["decimals"] = r.get("decimals", 9)
         result["symbol"] = r.get("symbol", "None")
     elif not metadata["symbol"]:
@@ -124,8 +114,6 @@ async def get_jetton_content_by_jetton_wallet(client:LiteClient, jetton_wallet):
     if result["symbol"].upper() in ["JUSDT", "JUSDC"]:
         result["decimals"] = 6
 
-    if result["symbol"].upper() in ["JARBUZ"]:
-        result["decimals"] = 18
     return result
 
 class BlockScanner:
@@ -243,7 +231,7 @@ async def handle_block(client:LiteClient, block: BlockIdExt):
     if block.workchain == -1:  # skip masterchain blocks
         return
     transactions = await client.raw_get_block_transactions_ext(block)
-    total = []
+
     for transaction in transactions:
         if not transaction.in_msg.is_internal:
             continue
@@ -253,7 +241,7 @@ async def handle_block(client:LiteClient, block: BlockIdExt):
             is_liquidity = False
             body_slice = transaction.in_msg.body.begin_parse()
             op_code = body_slice.load_uint(32)
-
+            # from user to router. transfer
             if op_code == 0x7362d09c:
                 query_id = body_slice.load_uint(64)
                 jetton_amount = body_slice.load_coins()
@@ -261,7 +249,19 @@ async def handle_block(client:LiteClient, block: BlockIdExt):
                 ref_msg_data = body_slice.load_ref().begin_parse()
                 transferred_op = ref_msg_data.load_uint(32)
                 pool_address = ref_msg_data.load_address().to_str()
-                if transferred_op != 0x25938561:
+                if transferred_op == 0x25938561:
+                    t = 0
+                    #swap
+                    # min_out = ref_msg_data.load_coins()
+                    # to_address = ref_msg_data.load_address().to_str()
+                    # has_ref = ref_msg_data.load_uint(1)
+                elif transferred_op == 0xfcf9e58f:
+                    #liquidity
+                    continue
+                    min_lp_out = ref_msg_data.load_coins()
+                    is_liquidity = True
+                else:
+                    #unknown
                     continue
 
                 jetton_data_in = await get_jetton_content_by_jetton_wallet(client, pool_address)
@@ -276,6 +276,10 @@ async def handle_block(client:LiteClient, block: BlockIdExt):
                         out_sender_address = out_body.load_address().to_str()
                         out_jetton_amount = out_body.load_coins()
                         out_j = out_body.load_coins()
+                    # elif out_op_code == 0xfcf9e58f:
+                    #     #liquidity
+                    #     out_j = ref_msg_data.load_coins()
+                    #     is_liquidity = True
                     else:
                         continue
 
@@ -283,41 +287,56 @@ async def handle_block(client:LiteClient, block: BlockIdExt):
 
                     if not await is_in_whitelist(client, out_sender_address) and not await is_in_whitelist(client, pool_address):
                         continue
+                    # is_jarbuz = jetton_data_out['symbol'] == "jARBUZ" or jetton_data_in['symbol'] == "jARBUZ"
                     
-                    decimals_in = jetton_data_in['decimals']
-                    decimals_out = jetton_data_out['decimals']
+                    decimals_in = 18 if jetton_data_in['symbol'] == "jARBUZ" else jetton_data_in['decimals']
+                    decimals_out = 18 if jetton_data_out['symbol'] == "jARBUZ" else  jetton_data_out['decimals']
                     in_amount = jetton_amount / (10 ** int(decimals_out))
                     out_amount = out_j / (10 ** int(decimals_in))
 
-                    # short = short_address(from_user)
+                    short = short_address(from_user)
                     text = ""
-                    is_sell = jetton_data_out['symbol'] == "ARBUZ"
-
-                    emoji_in = "🍉" if jetton_data_out['symbol'] == "ARBUZ" else "💎" if jetton_data_out['symbol'] == "pTON" else f"${jetton_data_out['symbol']}"
-                    emoji_out = "🍉" if jetton_data_in['symbol'] == "ARBUZ" else "💎"if jetton_data_in['symbol'] == "pTON" else f"${jetton_data_in['symbol']}"
-                    emoji_type = "💔" if is_sell else "💚"
-
-                    if in_amount < 1:
-                        in_amount= f"{in_amount:,.2f}"
+                    if is_liquidity:
+                        text = f"\n+{in_amount} #{jetton_data_out['symbol']}\n+{out_amount} #{jetton_data_in['symbol']}"
                     else:
-                        in_amount = f"{int(in_amount):,}"
+                        is_sell = jetton_data_out['symbol'] == "ARBUZ"
+                        emoji_in = "🍉" if jetton_data_out['symbol'] == "ARBUZ" else "💎" if jetton_data_out['symbol'] == "pTON" else f"${jetton_data_out['symbol']}"
+                        emoji_out = "🍉" if jetton_data_in['symbol'] == "ARBUZ" else "💎"if jetton_data_in['symbol'] == "pTON" else f"${jetton_data_in['symbol']}"
+                        emoji_type = "💔" if is_sell else "💚"
+                        text = f"{in_amount:,.2f} {emoji_in} ➡️ {out_amount:,.2f} {emoji_out}"
+                    message_with_link = f"{text}\n{emoji_type} [{short}](https://tonviewer.com/{from_user})"
+                    await bot.send_message(-1001998422328,message_with_link, disable_web_page_preview=True, parse_mode="Markdown")
+        # else:
+        #     body_slice = transaction.in_msg.body.begin_parse()
+        #     op_code = body_slice.load_uint(32)
+        #     text = ""
+        #     user = ""
+        #     if len(transaction.out_msgs) > 0:
+        #         out_body = transaction.out_msgs[0].body.begin_parse()
+        #         out_op_code = out_body.load_uint(32)
+        #         if out_op_code == 0x178d4519:
+        #             out_query_id = out_body.load_uint(64)
+        #             out_amount = out_body.load_coins()
 
-                    if out_amount < 1:
-                        out_amount = f"{out_amount:,.2f}"
-                    else:
-                        out_amount = f"{int(out_amount):,}"
+        #             user = out_body.load_address().to_str()
+            
+        #             short = short_address(user)
+        #             text = f"{short}"
 
-                    text = f"{in_amount} {emoji_in} ➡️ {out_amount} {emoji_out}"
-                    emoji_type = f"[{emoji_type}](https://tonviewer.com/{from_user})"
-                    message_with_link = f"{emoji_type} {text}"
-                    total.append(message_with_link)
-                    
-    if len(total) > 0:
-        left, right = await get_pool_data(client)
-        price = right / left
-        list_str = "\n".join(total)
-        result = f"{list_str}\n\n🍉 = {price:,.2f} 💎"
-        await bot.send_message(CHAT_ID,result, disable_web_page_preview=True, parse_mode="Markdown")
+        #     if op_code == 0x0f8a7ea5:
+        #         is_whitelisted = await is_in_whitelist(client, Address(f"0:{transaction.account_addr_hex}") )
+        #         if not is_whitelisted:
+        #             continue
+        #         query_id = body_slice.load_uint(64)
+        #         amount = body_slice.load_coins()
+        #         destination = body_slice.load_address().to_str()
+                
+                # dest = short_address(destination)
+                # amount_dfc = amount / (10 ** 9)
+                # text = f"{amount_dfc} DFC ➡️ {dest}"
+        
+                # message_with_link = f"{text}\n[{short}](https://tonviewer.com/{user})"
+                # await bot.send_message(-1001998422328,message_with_link, disable_web_page_preview=True, parse_mode="Markdown")
                
 async def main():
     client = None
@@ -332,12 +351,16 @@ async def main():
             await scanner.run()
         except Exception as exc:
             print(f"Attempt failed with error: {str(exc)}")
+            # my_traceback = "".join(traceback.format_exception(etype=None, value=exc, tb=exc.__traceback__))
+            # print(my_traceback)
             try:
                 await client.close()
             except:
                 pass
         finally:
-            await asyncio.sleep(3)
+            await asyncio.sleep(3)  # Wait for 10 seconds before retrying
 
 if __name__ == '__main__':
+    # Setup logging
+    # logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
